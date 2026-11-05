@@ -484,8 +484,12 @@ jobs:
         # is x64 / ARM64; the produced Package.msi is globbed since its bin/<platform>/ dir varies.
         if: env.UPLOAD_ARTIFACT == 'true'
         run: |
+          # NETAssist: MSI con il nome del prodotto personalizzato
+          if (Test-Path ./rustdesk-netassist) { Remove-Item -Recurse -Force ./rustdesk-netassist }
+          Copy-Item -Recurse ./rustdesk ./rustdesk-netassist
+          Rename-Item ./rustdesk-netassist/rustdesk.exe NETAssist.exe
           pushd ./res/msi
-          python preprocess.py --arp -d ../../rustdesk
+          python preprocess.py --arp -d ../../rustdesk-netassist --app-name NETAssist
           nuget restore msi.sln
           $msiPlatform = if ('${{ matrix.job.arch }}' -eq 'aarch64') { 'ARM64' } else { 'x64' }
           msbuild msi.sln -p:Configuration=Release -p:Platform=$msiPlatform /p:TargetVersion=Windows10

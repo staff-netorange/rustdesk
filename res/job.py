@@ -1,363 +1,156 @@
 #!/usr/bin/env python3
+"""
+NETAssist - firma del codice Windows con Azure Artifact Signing (ex "Trusted Signing").
 
-import requests
-import os
-import time
+Sostituisce res/job.py di RustDesk mantenendo la stessa interfaccia usata da
+.github/workflows/flutter-build.yml:
+
+    BASE_URL=<qualsiasi> SECRET_KEY=<segreto> python3 res/job.py sign_files <cartella> [estensioni]
+    BASE_URL=<qualsiasi> SECRET_KEY=<segreto> python3 res/job.py sign_one_file <file>
+
+Segreti del repository GitHub da impostare:
+  SIGN_BASE_URL   = azure          (qualsiasi valore: serve solo ad attivare i passaggi di firma)
+  SIGN_SECRET_KEY = base64 di un JSON come questo (una riga, senza spazi):
+      {"tenant_id":"...","client_id":"...","client_secret":"...",
+       "endpoint":"https://weu.codesigning.azure.net",
+       "account":"netorange-signing","profile":"netorange-public"}
+
+Il base64 evita problemi di virgolette quando il workflow espande il segreto nella shell.
+Requisiti sul runner Windows (già presenti su windows-2022): Windows SDK (signtool.exe), .NET 8.
+"""
 import argparse
+import base64
+import glob
+import json
 import logging
-import shutil
+import os
+import subprocess
 import sys
+import tempfile
+import urllib.request
 import zipfile
 
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
-def _file_stream_positions(files):
-    if not files:
-        return []
-    values = files.values() if hasattr(files, "values") else (item[1] for item in files)
-    positions = []
-    for value in values:
-        stream = value[1] if isinstance(value, tuple) and len(value) > 1 else value
-        if hasattr(stream, "tell") and hasattr(stream, "seek"):
-            try:
-                positions.append((stream, stream.tell()))
-            except (OSError, ValueError):
-                pass
-    return positions
+DLIB_PACKAGE = "Microsoft.ArtifactSigning.Client"
+DLIB_VERSION = os.environ.get("ARTIFACT_SIGNING_DLIB_VERSION", "1.0.146")
+TIMESTAMP_URL = "http://timestamp.acs.microsoft.com"
+SIGN_EXTENSIONS = [".exe", ".dll", ".sys", ".msi", ".cat", ".ps1", ".psm1", ".cab"]
+SKIP_DIR_MARKERS = ["RustDeskPrinterDriver", "usbmmidd_v2"]  # driver già firmati da terzi
+BATCH = 40
+WORK = os.path.join(tempfile.gettempdir(), "netassist-signing")
 
 
-def _with_simple_retries(fn, max_attempts=8, sleep_secs=1.0):
-    def _wrapper(*args, **kwargs):
-        file_positions = _file_stream_positions(kwargs.get("files"))
-        for i in range(max_attempts):
-            try:
-                if i:
-                    for stream, position in file_positions:
-                        stream.seek(position)
-                return fn(*args, **kwargs)
-            except Exception as e:
-                logging.warning(f"{fn.__name__} attempt {i+1}/{max_attempts} failed: {e}")
-                if i == max_attempts - 1:
-                    raise
-                time.sleep(sleep_secs)
-    return _wrapper
-
-
-HTTP_RETRY_MAX_TRIES = int(os.getenv("HTTP_RETRY_MAX_TRIES") or "8")
-HTTP_RETRY_SLEEP_SECS = float(os.getenv("HTTP_RETRY_SLEEP_SECS") or "1")
-
-requests.get = _with_simple_retries(requests.get, max_attempts=HTTP_RETRY_MAX_TRIES, sleep_secs=HTTP_RETRY_SLEEP_SECS)
-requests.post = _with_simple_retries(requests.post, max_attempts=HTTP_RETRY_MAX_TRIES, sleep_secs=HTTP_RETRY_SLEEP_SECS)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s [%(filename)s:%(lineno)d]",
-    handlers=[logging.StreamHandler()],
-)
-
-# The URL of your Flask server
-BASE_URL = os.getenv("BASE_URL") or "http://localhost:5000"
-
-# The secret key for API authentication
-SECRET_KEY = os.getenv("SECRET_KEY") or "worldpeace2024"
-
-# The headers for API requests
-HEADERS = {"Authorization": f"Bearer {SECRET_KEY}"}
-
-SIGN_TIMEOUT = int(os.getenv("SIGN_TIMEOUT") or "30")
-TIMEOUT = float(os.getenv("TIMEOUT") or "900")
-
-
-def create(task_name, file_path=None):
-    if file_path is None:
-        response = requests.post(
-            f"{BASE_URL}/tasks/{task_name}", timeout=TIMEOUT, headers=HEADERS
-        )
-    else:
-        with open(file_path, "rb") as f:
-            files = {"file": f}
-            response = requests.post(
-                f"{BASE_URL}/tasks/{task_name}",
-                timeout=TIMEOUT,
-                headers=HEADERS,
-                files=files,
-            )
-    return get_json(response)
-
-
-def upload_file(task_id, file_path):
-    with open(file_path, "rb") as f:
-        files = {"file": f}
-        response = requests.post(
-            f"{BASE_URL}/tasks/{task_id}/files",
-            timeout=TIMEOUT,
-            headers=HEADERS,
-            files=files,
-        )
-    return get_json(response)
-
-
-def get_status(task_id):
-    response = requests.get(
-        f"{BASE_URL}/tasks/{task_id}/status", timeout=TIMEOUT, headers=HEADERS
-    )
-    return get_json(response)
-
-
-def download_files(task_id, output_dir, fn=None):
-    response = requests.get(
-        f"{BASE_URL}/tasks/{task_id}/files",
-        timeout=TIMEOUT,
-        headers=HEADERS,
-        stream=True,
-    )
-
-    # Check if the request was successful
-    if fn is None:
-        fn = f"task_{task_id}_files.zip"
-    if response.status_code == 200:
-        # Save the file to the output directory
-        with open(os.path.join(output_dir, fn), "wb") as f:
-            for chunk in response.iter_content(chunk_size=1024):
-                if chunk:
-                    f.write(chunk)
-    return response.ok
-
-
-def download_one_file(task_id, file_id, output_dir):
-    response = requests.get(
-        f"{BASE_URL}/tasks/{task_id}/files/{file_id}",
-        timeout=TIMEOUT,
-        headers=HEADERS,
-        stream=True,
-    )
-
-    # Check if the request was successful
-    if response.status_code == 200:
-        # Save the file to the output directory
-        with open(os.path.join(output_dir, file_id), "wb") as f:
-            for chunk in response.iter_content(chunk_size=1024):
-                if chunk:
-                    f.write(chunk)
-    return response.ok
-
-
-def fetch(tag=None):
-    response = requests.get(
-        f"{BASE_URL}/tasks/fetch_task" + ("?tag=%s" % tag if tag else ""),
-        timeout=TIMEOUT,
-        headers=HEADERS,
-    )
-    return get_json(response)
-
-
-def update_status(task_id, status):
-    response = requests.patch(
-        f"{BASE_URL}/tasks/{task_id}/status",
-        timeout=TIMEOUT,
-        headers=HEADERS,
-        json=status,
-    )
-    return get_json(response)
-
-
-def delete_task(task_id):
-    response = requests.delete(
-        f"{BASE_URL}/tasks/{task_id}",
-        timeout=TIMEOUT,
-        headers=HEADERS,
-    )
-    return get_json(response)
-
-
-def sign(file_path):
-    res = create("sign", file_path)
-    if res.ok:
-        task_id = res.task_id
-
-        # Poll the status every second
-        while True:
-            status = get_status(task_id)
-            if status["status"] == "done":
-                # Download the files
-                download_files(task_id, "output")
-
-                # Delete the task
-                delete_task(task_id)
-
-                break
-
-            time.sleep(1)
-
-
-def sign_one_file(file_path):
-    logging.info(f"Signing {file_path}")
-    res = create("sign", file_path)
-    logging.info(f"Uploaded {file_path}")
-    task_id = res["id"]
-    n = 0
-    while True:
-        if n >= SIGN_TIMEOUT:
-            delete_task(task_id)
-            logging.error(f"Failed to sign {file_path}")
-            break
-        time.sleep(6)
-        n += 1
-        status = get_status(task_id)
-        if status and status.get("state") == "done":
-            downloaded = download_one_file(
-                task_id, os.path.basename(file_path), os.path.dirname(file_path)
-            )
-            delete_task(task_id)
-            if not downloaded:
-                logging.error(f"Failed to download signed {file_path}")
-                return False
-            logging.info(f"Signed {file_path}")
-            return True
-    return False
-
-
-def get_json(response):
+def load_secret():
+    raw = os.environ.get("SECRET_KEY", "").strip()
+    if not raw:
+        sys.exit("SECRET_KEY mancante")
     try:
-        return response.json()
-    except Exception as e:
-        raise Exception(response.text)
+        cfg = json.loads(base64.b64decode(raw).decode("utf-8"))
+    except Exception:
+        try:
+            cfg = json.loads(raw)
+        except Exception:
+            sys.exit("SECRET_KEY non valido: deve essere il JSON (in base64) con le credenziali Azure")
+    for k in ["tenant_id", "client_id", "client_secret", "endpoint", "account", "profile"]:
+        if not cfg.get(k):
+            sys.exit(f"SECRET_KEY: manca il campo {k}")
+    return cfg
 
 
-SIGN_EXTENSIONS = [
-    ".dll",
-    ".exe",
-    ".sys",
-    ".vxd",
-    ".msix",
-    ".msixbundle",
-    ".appx",
-    ".appxbundle",
-    ".msi",
-    ".msp",
-    ".msm",
-    ".cab",
-    ".ps1",
-    ".psm1",
-]
+def find_signtool():
+    cands = sorted(glob.glob(r"C:\Program Files (x86)\Windows Kits\10\bin\10.*\x64\signtool.exe"), reverse=True)
+    if not cands:
+        sys.exit("signtool.exe non trovato (serve il Windows SDK)")
+    return cands[0]
 
 
-def sign_files(dir_path, only_ext=None):
+def get_dlib():
+    dlib = os.path.join(WORK, "dlib", "bin", "x64", "Azure.CodeSigning.Dlib.dll")
+    if os.path.exists(dlib):
+        return dlib
+    os.makedirs(WORK, exist_ok=True)
+    url = f"https://www.nuget.org/api/v2/package/{DLIB_PACKAGE}/{DLIB_VERSION}"
+    pkg = os.path.join(WORK, "dlib.nupkg")
+    logging.info(f"Scarico {DLIB_PACKAGE} {DLIB_VERSION}")
+    urllib.request.urlretrieve(url, pkg)
+    with zipfile.ZipFile(pkg) as z:
+        z.extractall(os.path.join(WORK, "dlib"))
+    if not os.path.exists(dlib):
+        sys.exit(f"Azure.CodeSigning.Dlib.dll non trovata nel pacchetto {DLIB_PACKAGE}")
+    return dlib
+
+
+def metadata_file(cfg):
+    path = os.path.join(WORK, "metadata.json")
+    os.makedirs(WORK, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({
+            "Endpoint": cfg["endpoint"],
+            "CodeSigningAccountName": cfg["account"],
+            "CertificateProfileName": cfg["profile"],
+        }, f)
+    return path
+
+
+def is_signed(signtool, path):
+    r = subprocess.run([signtool, "verify", "/pa", "/q", path], capture_output=True)
+    return r.returncode == 0
+
+
+def sign_batch(files, cfg):
+    if not files:
+        return True
+    signtool = find_signtool()
+    env = dict(os.environ)
+    env.update({"AZURE_TENANT_ID": cfg["tenant_id"], "AZURE_CLIENT_ID": cfg["client_id"], "AZURE_CLIENT_SECRET": cfg["client_secret"]})
+    dlib, meta = get_dlib(), metadata_file(cfg)
+    ok = True
+    for i in range(0, len(files), BATCH):
+        chunk = files[i:i + BATCH]
+        cmd = [signtool, "sign", "/v", "/fd", "SHA256", "/tr", TIMESTAMP_URL, "/td", "SHA256", "/dlib", dlib, "/dmdf", meta] + chunk
+        logging.info(f"Firmo {len(chunk)} file…")
+        r = subprocess.run(cmd, env=env)
+        if r.returncode != 0:
+            logging.error("signtool ha restituito un errore")
+            ok = False
+    return ok
+
+
+def collect(dir_path, only_ext=None):
     if only_ext:
-        only_ext = only_ext.split(",")
-        for i in range(len(only_ext)):
-            if not only_ext[i].startswith("."):
-                only_ext[i] = "." + only_ext[i]
-    for root, dirs, files in os.walk(dir_path):
-        is_signed_dir = "RustDeskPrinterDriver" in root or "usbmmidd_v2" in root
-        for file in files:
-            file_path = os.path.join(root, file)
-            _, ext = os.path.splitext(file_path)
-            # only sign the exe files in signed dirs
-            if is_signed_dir and ext not in [".exe"]:
+        only_ext = ["." + e.lstrip(".") for e in only_ext.split(",")]
+    signtool = find_signtool()
+    out = []
+    for root, _dirs, files in os.walk(dir_path):
+        if any(m in root for m in SKIP_DIR_MARKERS):
+            continue
+        for name in files:
+            p = os.path.join(root, name)
+            ext = os.path.splitext(name)[1].lower()
+            if ext not in SIGN_EXTENSIONS or (only_ext and ext not in only_ext):
                 continue
-            if only_ext and ext not in only_ext:
+            if is_signed(signtool, p):
+                logging.info(f"già firmato: {p}")
                 continue
-            if ext in SIGN_EXTENSIONS:
-                if not sign_one_file(file_path):
-                    logging.error(f"Failed to sign {file_path}")
-                    sys.exit(1)
+            out.append(p)
+    return out
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Command line interface for task operations."
-    )
-    subparsers = parser.add_subparsers(dest="command")
-
-    # Create a parser for the "sign_one_file" command
-    sign_one_file_parser = subparsers.add_parser(
-        "sign_one_file", help="Sign a single file."
-    )
-    sign_one_file_parser.add_argument("file_path", help="The path of the file to sign.")
-
-    # Create a parser for the "sign_files" command
-    sign_files_parser = subparsers.add_parser(
-        "sign_files", help="Sign all files in a directory."
-    )
-    sign_files_parser.add_argument(
-        "dir_path", help="The path of the directory containing the files to sign."
-    )
-    sign_files_parser.add_argument(
-        "only_ext", help="The file extension to sign.", default=None, nargs="?"
-    )
-
-    # Create a parser for the "fetch" command
-    fetch_parser = subparsers.add_parser("fetch", help="Fetch a task.")
-
-    # Create a parser for the "update_status" command
-    update_status_parser = subparsers.add_parser(
-        "update_status", help="Update the status of a task."
-    )
-    update_status_parser.add_argument("task_id", help="The ID of the task to update.")
-    update_status_parser.add_argument("status", help="The new status of the task.")
-
-    # Create a parser for the "delete_task" command
-    delete_task_parser = subparsers.add_parser("delete_task", help="Delete a task.")
-    delete_task_parser.add_argument("task_id", help="The ID of the task to delete.")
-
-    # Create a parser for the "create" command
-    create_parser = subparsers.add_parser("create", help="Create a task.")
-    create_parser.add_argument("task_name", help="The name of the task to create.")
-    create_parser.add_argument(
-        "file_path",
-        help="The path of the file for the task.",
-        default=None,
-        nargs="?",
-    )
-
-    # Create a parser for the "upload_file" command
-    upload_file_parser = subparsers.add_parser(
-        "upload_file", help="Upload a file to a task."
-    )
-    upload_file_parser.add_argument(
-        "task_id", help="The ID of the task to upload the file to."
-    )
-    upload_file_parser.add_argument("file_path", help="The path of the file to upload.")
-
-    # Create a parser for the "get_status" command
-    get_status_parser = subparsers.add_parser(
-        "get_status", help="Get the status of a task."
-    )
-    get_status_parser.add_argument(
-        "task_id", help="The ID of the task to get the status of."
-    )
-
-    # Create a parser for the "download_files" command
-    download_files_parser = subparsers.add_parser(
-        "download_files", help="Download files from a task."
-    )
-    download_files_parser.add_argument(
-        "task_id", help="The ID of the task to download files from."
-    )
-    download_files_parser.add_argument(
-        "output_dir", help="The directory to save the downloaded files to."
-    )
-
-    args = parser.parse_args()
-
-    if args.command == "sign_one_file":
-        sign_one_file(args.file_path)
-    elif args.command == "sign_files":
-        sign_files(args.dir_path, args.only_ext)
-    elif args.command == "fetch":
-        print(fetch())
-    elif args.command == "update_status":
-        print(update_status(args.task_id, args.status))
-    elif args.command == "delete_task":
-        print(delete_task(args.task_id))
-    elif args.command == "create":
-        print(create(args.task_name, args.file_path))
-    elif args.command == "upload_file":
-        print(upload_file(args.task_id, args.file_path))
-    elif args.command == "get_status":
-        print(get_status(args.task_id))
-    elif args.command == "download_files":
-        print(download_files(args.task_id, args.output_dir))
+    ap = argparse.ArgumentParser()
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    a = sub.add_parser("sign_files")
+    a.add_argument("dir_path")
+    a.add_argument("only_ext", nargs="?", default=None)
+    b = sub.add_parser("sign_one_file")
+    b.add_argument("file_path")
+    args = ap.parse_args()
+    cfg = load_secret()
+    files = collect(args.dir_path, args.only_ext) if args.cmd == "sign_files" else [args.file_path]
+    if not sign_batch(files, cfg):
+        sys.exit(1)
+    logging.info(f"Firmati {len(files)} file")
 
 
 if __name__ == "__main__":
