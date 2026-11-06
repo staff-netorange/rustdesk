@@ -1914,7 +1914,12 @@ impl Connection {
         // One-time means gone once it has let a peer in, not once that peer
         // leaves. This session's later logins come in on the password the
         // session remembers, so they are not affected.
-        password::update_temporary_password();
+        // NETAssist: durante una sessione di assistenza del portale non ruotiamo la
+        // password monouso: la stessa password vale per l'intera sessione e per
+        // ogni nuovo tipo di connessione (schermo, file, telecamera, terminale).
+        if hbb_common::config::Config::get_option("netassist-session-active") != "Y" {
+            password::update_temporary_password();
+        }
         // Releases the budget `check_id_whitelist` charges against this address: only a peer
         // that got this far proved more than a self-reported id.
         self.clear_id_whitelist_failures();

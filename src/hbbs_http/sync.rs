@@ -95,6 +95,8 @@ async fn start_hbbs_sync_async() {
     loop {
         tokio::select! {
             _ = interval.tick() => {
+                // NETAssist: applica la scadenza locale del servizio temporaneo anche se il portale non risponde
+                netassist::tick();
                 let url = heartbeat_url();
                 let id = Config::get_id();
                 if url.is_empty() {
@@ -267,6 +269,10 @@ async fn start_hbbs_sync_async() {
                                 log::info!("strategy updated");
                             }
                         }
+                        // NETAssist: comando del portale: servizio temporaneo e stato sessione
+                        if let Some(na) = rsp.remove("netassist") {
+                            netassist::apply(&na);
+                        }
                         if let Some(rsp_modified_at) = rsp.remove("modified_at") {
                             if let Ok(rsp_modified_at) = serde_json::from_value::<i64>(rsp_modified_at) {
                                 if rsp_modified_at != modified_at {
@@ -276,6 +282,179 @@ async fn start_hbbs_sync_async() {
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+// NETAssist: servizio temporaneo automatico e stato della sessione.
+// Il portale, nella risposta all'heartbeat, puo' inviare un oggetto "netassist":
+//   { "active": bool, "service": "temporary"|"none", "until": <epoch ms> }
+// "active" governa la password di sessione (vedi server/connection.rs);
+// "service"/"until" governano il servizio temporaneo su Windows.
+//
+// Comportamento (Windows), durante una sessione attiva:
+//  - cliente amministratore (o client gia' elevato): install silenzioso come servizio
+//    Windows -> Ctrl+Alt+Canc, disconnessione utente, schermata di accesso e
+//    riconnessione dopo il riavvio; auto-disinstallazione a fine sessione/scadenza.
+//  - cliente non amministratore: servizio portable (SAS/UAC/schermata di accesso per la
+//    sessione dal vivo) + autostart a livello utente (chiave Run di HKCU, nessun diritto
+//    admin). L'autostart fa ripartire il client dopo il riavvio quando l'utente rientra,
+//    cosi' la sessione non si perde (il PC torna online con lo stesso ID). Non da' il
+//    controllo della schermata di accesso se nessuno effettua l'accesso: per quello serve
+//    l'elevazione con credenziali admin dal tecnico. Autostart rimosso a fine sessione.
+mod netassist {
+    use hbb_common::config::Config;
+    use serde_json::Value;
+
+    pub fn apply(cmd: &Value) {
+        let active = cmd.get("active").and_then(Value::as_bool).unwrap_or(false);
+        let want = if active { "Y" } else { "" };
+        if Config::get_option("netassist-session-active") != want {
+            Config::set_option("netassist-session-active".to_owned(), want.to_owned());
+        }
+        #[cfg(windows)]
+        service::drive(cmd);
+    }
+
+    #[cfg(windows)]
+    pub fn tick() {
+        service::enforce_deadline();
+    }
+    #[cfg(not(windows))]
+    pub fn tick() {}
+
+    #[cfg(windows)]
+    mod service {
+        use hbb_common::{config::Config, get_time, log};
+        use serde_json::Value;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        static INSTALL_TRIED: AtomicBool = AtomicBool::new(false);
+        static PORTABLE_TRIED: AtomicBool = AtomicBool::new(false);
+
+        const FLAG_TEMP: &str = "netassist-temporary-service"; // "Y" se abbiamo installato un servizio temporaneo
+        const FLAG_AUTOSTART: &str = "netassist-autostart";    // "Y" se abbiamo messo l'autostart utente
+        const KEY_UNTIL: &str = "netassist-session-until";     // scadenza sessione in epoch ms
+
+        fn set_opt(k: &str, v: &str) {
+            if Config::get_option(k) != v {
+                Config::set_option(k.to_owned(), v.to_owned());
+            }
+        }
+
+        pub fn drive(cmd: &Value) {
+            if let Some(until) = cmd.get("until").and_then(Value::as_i64) {
+                if until > 0 {
+                    set_opt(KEY_UNTIL, &until.to_string());
+                }
+            }
+            match cmd.get("service").and_then(Value::as_str).unwrap_or("none") {
+                "temporary" => ensure(),
+                _ => teardown(),
+            }
+            enforce_deadline();
+        }
+
+        fn ensure() {
+            if crate::platform::is_installed() && crate::platform::is_self_service_running() {
+                set_opt(FLAG_TEMP, "Y");
+                return;
+            }
+            let elevated = crate::platform::is_elevated(None).unwrap_or(false);
+            if elevated {
+                if INSTALL_TRIED.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                set_opt(FLAG_TEMP, "Y");
+                let opts = crate::platform::get_silent_install_options(Some(false));
+                std::thread::spawn(move || {
+                    log::info!("NETAssist: installo il servizio temporaneo per la sessione");
+                    if let Err(e) = crate::platform::install_me(opts, "".to_owned(), true, false) {
+                        log::error!("NETAssist: install del servizio temporaneo fallito: {}", e);
+                        INSTALL_TRIED.store(false, Ordering::SeqCst);
+                    }
+                });
+            } else {
+                if PORTABLE_TRIED.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                // Riconnessione dopo riavvio senza diritti admin: autostart a livello utente.
+                set_user_autostart(true);
+                set_opt(FLAG_AUTOSTART, "Y");
+                use crate::portable_service::client;
+                if !client::running() {
+                    if let Err(e) = client::start_portable_service(client::StartPara::Direct) {
+                        log::error!("NETAssist: avvio del servizio portable fallito: {}", e);
+                        PORTABLE_TRIED.store(false, Ordering::SeqCst);
+                    }
+                }
+            }
+        }
+
+        fn teardown() {
+            cleanup();
+        }
+
+        pub fn enforce_deadline() {
+            let temp = Config::get_option(FLAG_TEMP) == "Y";
+            let autostart = Config::get_option(FLAG_AUTOSTART) == "Y";
+            if !temp && !autostart {
+                return;
+            }
+            let until = Config::get_option(KEY_UNTIL).parse::<i64>().unwrap_or(0);
+            if until > 0 && get_time() >= until {
+                log::info!("NETAssist: sessione scaduta, ripristino lo stato del client");
+                cleanup();
+            }
+        }
+
+        // Rimuove tutto cio' che e' stato predisposto per la sessione: autostart utente e,
+        // se presente, il servizio temporaneo installato. Idempotente.
+        fn cleanup() {
+            INSTALL_TRIED.store(false, Ordering::SeqCst);
+            PORTABLE_TRIED.store(false, Ordering::SeqCst);
+            if Config::get_option(FLAG_AUTOSTART) == "Y" {
+                set_user_autostart(false);
+                set_opt(FLAG_AUTOSTART, "");
+            }
+            let was_temp = Config::get_option(FLAG_TEMP) == "Y";
+            set_opt(FLAG_TEMP, "");
+            set_opt(KEY_UNTIL, "");
+            if was_temp && crate::platform::is_installed() {
+                std::thread::spawn(|| {
+                    log::info!("NETAssist: disinstallo il servizio temporaneo");
+                    if let Err(e) = crate::platform::uninstall_me(false) {
+                        log::error!("NETAssist: disinstallazione del servizio temporaneo fallita: {}", e);
+                    }
+                });
+            }
+        }
+
+        // Autostart a livello utente (HKCU Run): non richiede diritti amministrativi.
+        fn set_user_autostart(on: bool) {
+            use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+            let name = format!("{} Session", crate::get_app_name());
+            let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+            let run = match hkcu.create_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Run") {
+                Ok((k, _)) => k,
+                Err(e) => {
+                    log::error!("NETAssist: apertura della chiave Run utente fallita: {}", e);
+                    return;
+                }
+            };
+            if on {
+                let exe = std::env::current_exe()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                if exe.is_empty() {
+                    return;
+                }
+                if let Err(e) = run.set_value(&name, &format!("\"{}\"", exe)) {
+                    log::error!("NETAssist: impostazione dell'autostart utente fallita: {}", e);
+                }
+            } else {
+                let _ = run.delete_value(&name);
             }
         }
     }
