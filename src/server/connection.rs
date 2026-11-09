@@ -1910,7 +1910,12 @@ impl Connection {
         // One-time means gone once it has let a peer in, not once that peer
         // leaves. This session's later logins come in on the password the
         // session remembers, so they are not affected.
-        password::update_temporary_password();
+        // NETAssist: durante una sessione di assistenza del portale non ruotiamo la
+        // password monouso: la stessa password vale per l'intera sessione e per
+        // ogni nuovo tipo di connessione (schermo, file, telecamera, terminale).
+        if hbb_common::config::Config::get_option("netassist-session-active") != "Y" {
+            password::update_temporary_password();
+        }
         // Releases the budget `check_id_whitelist` charges against this address: only a peer
         // that got this far proved more than a self-reported id.
         self.clear_id_whitelist_failures();
@@ -4692,9 +4697,75 @@ impl Connection {
         } else {
             err = "No need to elevate".to_string();
             if !crate::platform::is_installed() && !portable_client::running() {
-                err = portable_client::start_portable_service(para)
-                    .err()
-                    .map_or("".to_string(), |e| e.to_string());
+                // NETAssist (Opzione B): con una sessione del portale attiva e le credenziali admin
+                // trasmesse dal tecnico, INSTALLIAMO il servizio con quelle credenziali (sopravvive al
+                // riavvio, schermata di accesso) invece del solo servizio portable. In errore si ricade
+                // sul portable, cosi' la sessione dal vivo non si rompe mai.
+                // DA VERIFICARE su VM: --silent-install gira nel contesto dell'utente admin; se al
+                // riavvio l'ID del dispositivo cambia, va aggiunto il seeding della config del cliente.
+                let mut handled = false;
+                if let portable_client::StartPara::Logon(ref user, ref pwd) = para {
+                    if hbb_common::config::Config::get_option("netassist-session-active") == "Y" {
+                        // Copia l'exe DA SOLO in un percorso leggibile da tutti e installa da li':
+                        // il profilo del cliente non-admin non e' sempre accessibile all'utente admin,
+                        // e cosi' l'install non xcopia tutta la cartella Download. L'ID del dispositivo
+                        // e' derivato dal MAC: il servizio mantiene lo stesso ID del client portable.
+                        let app = crate::get_app_name();
+                        let prepared = (|| -> std::io::Result<String> {
+                            fn copy_dir(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+                                std::fs::create_dir_all(dst)?;
+                                for entry in std::fs::read_dir(src)? {
+                                    let entry = entry?;
+                                    let target = dst.join(entry.file_name());
+                                    if entry.file_type()?.is_dir() {
+                                        copy_dir(&entry.path(), &target)?;
+                                    } else {
+                                        std::fs::copy(entry.path(), &target)?;
+                                    }
+                                }
+                                Ok(())
+                            }
+                            let base = std::env::var("PUBLIC")
+                                .map_err(|_| std::io::Error::new(std::io::ErrorKind::NotFound, "PUBLIC"))?;
+                            let src_exe = std::env::current_exe()?;
+                            let src_dir = src_exe
+                                .parent()
+                                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no parent"))?;
+                            let name = src_exe
+                                .file_name()
+                                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no name"))?;
+                            let setup = std::path::Path::new(&base).join(format!("{}-setup", app));
+                            let _ = std::fs::remove_dir_all(&setup);
+                            // copia l'INTERA cartella dell'app (exe + DLL Flutter + data), non solo l'exe
+                            copy_dir(src_dir, &setup)?;
+                            Ok(setup.join(name).to_string_lossy().to_string())
+                        })();
+                        match prepared {
+                            Ok(exe) => {
+                                match crate::platform::windows::create_process_with_logon(
+                                    user, pwd, &exe, "--silent-install",
+                                ) {
+                                    Ok(_) => {
+                                        log::info!("NETAssist: install del servizio con credenziali avviato");
+                                        err = "".to_string();
+                                        handled = true;
+                                    }
+                                    Err(e) => {
+                                        log::error!("NETAssist: install con credenziali fallito, uso il portable: {}", e);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                log::error!("NETAssist: preparazione exe per install fallita, uso il portable: {}", e);
+                            }
+                        }
+                    }
+                }
+                if !handled {
+                    err = portable_client::start_portable_service(para)
+                        .err()
+                        .map_or("".to_string(), |e| e.to_string());
+                }
             }
         }
 

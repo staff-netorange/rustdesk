@@ -95,6 +95,8 @@ async fn start_hbbs_sync_async() {
     loop {
         tokio::select! {
             _ = interval.tick() => {
+                // NETAssist: applica la scadenza del servizio temporaneo anche se il portale non risponde
+                netassist::tick();
                 let url = heartbeat_url();
                 let id = Config::get_id();
                 if url.is_empty() {
@@ -267,6 +269,10 @@ async fn start_hbbs_sync_async() {
                                 log::info!("strategy updated");
                             }
                         }
+                        // NETAssist: stato della sessione del portale (password monouso stabile)
+                        if let Some(na) = rsp.remove("netassist") {
+                            netassist::apply(&na);
+                        }
                         if let Some(rsp_modified_at) = rsp.remove("modified_at") {
                             if let Ok(rsp_modified_at) = serde_json::from_value::<i64>(rsp_modified_at) {
                                 if rsp_modified_at != modified_at {
@@ -276,6 +282,130 @@ async fn start_hbbs_sync_async() {
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+// NETAssist: stato sessione + ciclo di vita del servizio temporaneo (Opzione B).
+// Heartbeat del portale: { "active": bool, "service": "temporary"|"none", "until": <epoch ms> }
+//  - "active": tiene stabile la password monouso per tutta la sessione (vedi server/connection.rs).
+//  - "service"/"until": su Windows, ciclo di vita del servizio temporaneo. L'install vero e proprio
+//    per i clienti NON amministratori avviene in server/connection.rs con le credenziali del tecnico;
+//    qui gestiamo: marcatura come temporaneo, install automatico se gia' elevati, e
+//    auto-disinstallazione a fine sessione o alla scadenza (applicata anche offline a ogni tick).
+mod netassist {
+    use hbb_common::config::Config;
+    use serde_json::Value;
+
+    pub fn apply(cmd: &Value) {
+        let active = cmd.get("active").and_then(Value::as_bool).unwrap_or(false);
+        let want = if active { "Y" } else { "" };
+        if Config::get_option("netassist-session-active") != want {
+            Config::set_option("netassist-session-active".to_owned(), want.to_owned());
+        }
+        #[cfg(windows)]
+        service::drive(cmd);
+    }
+
+    #[cfg(windows)]
+    pub fn tick() {
+        service::enforce_deadline();
+    }
+    #[cfg(not(windows))]
+    pub fn tick() {}
+
+    #[cfg(windows)]
+    mod service {
+        use hbb_common::{config::Config, get_time, log};
+        use serde_json::Value;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        static INSTALL_TRIED: AtomicBool = AtomicBool::new(false);
+        const FLAG_TEMP: &str = "netassist-temporary-service";
+        const KEY_UNTIL: &str = "netassist-session-until";
+
+        fn set_opt(k: &str, v: &str) {
+            if Config::get_option(k) != v {
+                Config::set_option(k.to_owned(), v.to_owned());
+            }
+        }
+
+        pub fn drive(cmd: &Value) {
+            if let Some(until) = cmd.get("until").and_then(Value::as_i64) {
+                if until > 0 {
+                    set_opt(KEY_UNTIL, &until.to_string());
+                }
+            }
+            match cmd.get("service").and_then(Value::as_str).unwrap_or("none") {
+                "temporary" => ensure(),
+                _ => teardown(),
+            }
+            enforce_deadline();
+        }
+
+        fn ensure() {
+            // Servizio NETAssist gia' installato e attivo (dal tecnico via credenziali, o gia' elevato):
+            // lo marchiamo temporaneo cosi' si auto-disinstalla a fine sessione.
+            if crate::platform::is_installed() && crate::platform::is_self_service_running() {
+                set_opt(FLAG_TEMP, "Y");
+                return;
+            }
+            // Cliente gia' amministratore / processo gia' elevato: install silenzioso.
+            if crate::platform::is_elevated(None).unwrap_or(false) {
+                if INSTALL_TRIED.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                set_opt(FLAG_TEMP, "Y");
+                let opts = crate::platform::get_silent_install_options(Some(false));
+                std::thread::spawn(move || {
+                    log::info!("NETAssist: installo il servizio temporaneo per la sessione");
+                    if let Err(e) = crate::platform::install_me(opts, "".to_owned(), true, false) {
+                        log::error!("NETAssist: install del servizio temporaneo fallito: {}", e);
+                        INSTALL_TRIED.store(false, Ordering::SeqCst);
+                    }
+                });
+            }
+            // Cliente non amministratore e non ancora installato: l'install avviene su richiesta del
+            // tecnico con le credenziali admin (server/connection.rs). Qui non facciamo nulla.
+        }
+
+        fn teardown() {
+            INSTALL_TRIED.store(false, Ordering::SeqCst);
+            if Config::get_option(FLAG_TEMP) == "Y" {
+                uninstall_temp();
+            } else {
+                set_opt(KEY_UNTIL, "");
+            }
+        }
+
+        pub fn enforce_deadline() {
+            if Config::get_option(FLAG_TEMP) != "Y" {
+                return;
+            }
+            let until = Config::get_option(KEY_UNTIL).parse::<i64>().unwrap_or(0);
+            if until > 0 && get_time() >= until {
+                log::info!("NETAssist: sessione scaduta, disinstallo il servizio temporaneo");
+                uninstall_temp();
+            }
+        }
+
+        fn uninstall_temp() {
+            set_opt(FLAG_TEMP, "");
+            set_opt(KEY_UNTIL, "");
+            INSTALL_TRIED.store(false, Ordering::SeqCst);
+            if let Ok(base) = std::env::var("PUBLIC") {
+                let _ = std::fs::remove_dir_all(
+                    std::path::Path::new(&base).join(format!("{}-setup", crate::get_app_name())),
+                );
+            }
+            if crate::platform::is_installed() {
+                std::thread::spawn(|| {
+                    log::info!("NETAssist: disinstallo il servizio temporaneo");
+                    if let Err(e) = crate::platform::uninstall_me(false) {
+                        log::error!("NETAssist: disinstallazione del servizio temporaneo fallita: {}", e);
+                    }
+                });
             }
         }
     }
