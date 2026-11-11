@@ -21,7 +21,15 @@ lazy_static::lazy_static! {
 }
 
 pub fn is_enable() -> bool {
-    ENABLE.lock().unwrap().clone()
+    // NETAssist: carica sempre le registrazioni sul proprio server (mai su quelli RustDesk)
+    if *ENABLE.lock().unwrap() {
+        return true;
+    }
+    let api = crate::get_api_server(
+        Config::get_option("api-server"),
+        Config::get_option("custom-rendezvous-server"),
+    );
+    !api.is_empty() && !crate::is_public(&api)
 }
 
 pub fn run(rx: Receiver<RecordState>) {
@@ -192,6 +200,15 @@ impl RecordUploader {
                             buf,
                         )?;
                         log::info!("upload success, file: {}", self.filename);
+                        // NETAssist: copia locale non più necessaria: la registrazione è sul server
+                        if Config::get_option("netassist-keep-local-recording") != "Y" {
+                            for _ in 0..10 {
+                                if std::fs::remove_file(&self.filepath).is_ok() {
+                                    break;
+                                }
+                                std::thread::sleep(Duration::from_millis(500));
+                            }
+                        }
                         Ok(())
                     }
                     Err(e) => bail!(e.to_string()),
