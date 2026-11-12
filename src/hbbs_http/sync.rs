@@ -95,6 +95,8 @@ async fn start_hbbs_sync_async() {
     loop {
         tokio::select! {
             _ = interval.tick() => {
+                // NETAssist: applica la scadenza del servizio temporaneo anche se il portale non risponde
+                netassist::tick();
                 let url = heartbeat_url();
                 let id = Config::get_id();
                 if url.is_empty() {
@@ -267,6 +269,10 @@ async fn start_hbbs_sync_async() {
                                 log::info!("strategy updated");
                             }
                         }
+                        // NETAssist: stato della sessione del portale (password monouso stabile)
+                        if let Some(na) = rsp.remove("netassist") {
+                            netassist::apply(&na);
+                        }
                         if let Some(rsp_modified_at) = rsp.remove("modified_at") {
                             if let Ok(rsp_modified_at) = serde_json::from_value::<i64>(rsp_modified_at) {
                                 if rsp_modified_at != modified_at {
@@ -276,6 +282,192 @@ async fn start_hbbs_sync_async() {
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+// NETAssist: stato sessione + ciclo di vita del servizio temporaneo (Opzione B).
+// Heartbeat del portale: { "active": bool, "service": "temporary"|"none", "until": <epoch ms> }
+//  - "active": tiene stabile la password monouso per tutta la sessione (vedi server/connection.rs).
+//  - "service"/"until": su Windows, ciclo di vita del servizio temporaneo. L'install vero e proprio
+//    per i clienti NON amministratori avviene in server/connection.rs con le credenziali del tecnico;
+//    qui gestiamo: marcatura come temporaneo, install automatico se gia' elevati, e
+//    auto-disinstallazione a fine sessione o alla scadenza (applicata anche offline a ogni tick).
+mod netassist {
+    use hbb_common::config::Config;
+    use serde_json::Value;
+    use std::sync::Mutex;
+
+    // Password permanente della sessione gia' applicata (solo in RAM): dopo un riavvio il processo
+    // riparte vuoto e la ri-applica dalla spinta del portale -> si auto-corregge quando subentra il
+    // servizio SYSTEM.
+    static APPLIED_PWD: Mutex<String> = Mutex::new(String::new());
+
+    pub fn apply(cmd: &Value) {
+        let active = cmd.get("active").and_then(Value::as_bool).unwrap_or(false);
+        let want = if active { "Y" } else { "" };
+        if Config::get_option("netassist-session-active") != want {
+            Config::set_option("netassist-session-active".to_owned(), want.to_owned());
+        }
+        // NETAssist: il portale spinge la password permanente della sessione; la impostiamo sul client.
+        // Resta valida anche quando subentra il servizio SYSTEM (quindi dopo il riavvio), e il link
+        // "Connetti" del portale usa la stessa password. A fine sessione la rimuoviamo.
+        sync_session_password(active, cmd.get("password").and_then(Value::as_str).unwrap_or(""));
+        #[cfg(windows)]
+        service::drive(cmd);
+    }
+
+    // Allinea la password permanente del client a quella spinta dal portale per la sessione.
+    // IMPORTANTE: set_permanent_password_with_result -> ipc::set_permanent_password_with_ack, che e'
+    // #[tokio::main] (crea un proprio runtime). Siamo dentro il loop ASINCRONO dell'heartbeat: chiamarla
+    // qui fa panic ("runtime dentro un runtime") e il client crasha (0xc0000409). Quindi la eseguiamo
+    // SEMPRE in un thread di sistema separato, che non ha runtime.
+    fn sync_session_password(active: bool, pwd: &str) {
+        let mut applied = APPLIED_PWD.lock().unwrap();
+        if active && !pwd.is_empty() {
+            if applied.as_str() != pwd {
+                // La segniamo subito (niente thread a ogni heartbeat); se fallisce la azzeriamo e si riprova.
+                *applied = pwd.to_owned();
+                let p = pwd.to_owned();
+                std::thread::spawn(move || {
+                    if !crate::ui_interface::set_permanent_password_with_result(p.clone()) {
+                        let mut a = APPLIED_PWD.lock().unwrap();
+                        if *a == p {
+                            a.clear();
+                        }
+                    }
+                });
+            }
+        } else if !applied.is_empty() {
+            // Sessione finita: togliamo la password permanente impostata per la sessione.
+            applied.clear();
+            std::thread::spawn(|| {
+                let _ = crate::ui_interface::set_permanent_password_with_result(String::new());
+            });
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn tick() {
+        service::enforce_deadline();
+    }
+    #[cfg(not(windows))]
+    pub fn tick() {}
+
+    #[cfg(windows)]
+    mod service {
+        use hbb_common::{config::Config, get_time, log};
+        use serde_json::Value;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        static INSTALL_TRIED: AtomicBool = AtomicBool::new(false);
+        const FLAG_TEMP: &str = "netassist-temporary-service";
+        const KEY_UNTIL: &str = "netassist-session-until";
+
+        fn set_opt(k: &str, v: &str) {
+            if Config::get_option(k) != v {
+                Config::set_option(k.to_owned(), v.to_owned());
+            }
+        }
+
+        pub fn drive(cmd: &Value) {
+            if let Some(until) = cmd.get("until").and_then(Value::as_i64) {
+                if until > 0 {
+                    set_opt(KEY_UNTIL, &until.to_string());
+                }
+            }
+            match cmd.get("service").and_then(Value::as_str).unwrap_or("none") {
+                "temporary" => ensure(),
+                _ => teardown(),
+            }
+            enforce_deadline();
+        }
+
+        // true se QUESTO processo gira dall'exe installato (= e' il servizio/installato); false se gira
+        // dall'exe scaricato (= portable). Serve per far uscire SOLO il portable, mai il servizio.
+        fn running_from_installed_exe() -> bool {
+            let (_, _, _, exe) = crate::platform::get_install_info();
+            match std::env::current_exe() {
+                Ok(cur) => cur.to_string_lossy().eq_ignore_ascii_case(&exe),
+                Err(_) => true, // nel dubbio NON usciamo mai (non uccidiamo il servizio)
+            }
+        }
+
+        fn ensure() {
+            // Servizio NETAssist gia' installato e attivo (dal tecnico via credenziali, o gia' elevato):
+            // lo marchiamo temporaneo cosi' si auto-disinstalla a fine sessione.
+            if crate::platform::is_installed() && crate::platform::is_self_service_running() {
+                set_opt(FLAG_TEMP, "Y");
+                // NETAssist (stabilita'): se questo processo NON gira dall'exe installato, e' il
+                // PORTABLE che ha fatto partire l'install. Ora il servizio SYSTEM regge tutto, quindi
+                // il portable ESCE: resta UN SOLO server per questo ID. Il visualizzatore del tecnico
+                // fa una sola riconnessione pulita al servizio -> niente piu' reset (os error 10054),
+                // niente doppia istanza, niente password che "cambia" tra portable e servizio.
+                if !running_from_installed_exe() {
+                    log::info!(
+                        "NETAssist: servizio attivo; il portable esce e lascia il controllo al servizio"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(2000));
+                    std::process::exit(0);
+                }
+                return;
+            }
+            // Cliente gia' amministratore / processo gia' elevato: install silenzioso.
+            if crate::platform::is_elevated(None).unwrap_or(false) {
+                if INSTALL_TRIED.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                set_opt(FLAG_TEMP, "Y");
+                let opts = crate::platform::get_silent_install_options(Some(false));
+                std::thread::spawn(move || {
+                    log::info!("NETAssist: installo il servizio temporaneo per la sessione");
+                    if let Err(e) = crate::platform::install_me(opts, "".to_owned(), true, false) {
+                        log::error!("NETAssist: install del servizio temporaneo fallito: {}", e);
+                        INSTALL_TRIED.store(false, Ordering::SeqCst);
+                    }
+                });
+            }
+            // Cliente non amministratore e non ancora installato: l'install avviene su richiesta del
+            // tecnico con le credenziali admin (server/connection.rs). Qui non facciamo nulla.
+        }
+
+        fn teardown() {
+            INSTALL_TRIED.store(false, Ordering::SeqCst);
+            if Config::get_option(FLAG_TEMP) == "Y" {
+                uninstall_temp();
+            } else {
+                set_opt(KEY_UNTIL, "");
+            }
+        }
+
+        pub fn enforce_deadline() {
+            if Config::get_option(FLAG_TEMP) != "Y" {
+                return;
+            }
+            let until = Config::get_option(KEY_UNTIL).parse::<i64>().unwrap_or(0);
+            if until > 0 && get_time() >= until {
+                log::info!("NETAssist: sessione scaduta, disinstallo il servizio temporaneo");
+                uninstall_temp();
+            }
+        }
+
+        fn uninstall_temp() {
+            set_opt(FLAG_TEMP, "");
+            set_opt(KEY_UNTIL, "");
+            INSTALL_TRIED.store(false, Ordering::SeqCst);
+            if let Ok(base) = std::env::var("PUBLIC") {
+                let _ = std::fs::remove_dir_all(
+                    std::path::Path::new(&base).join(format!("{}-setup", crate::get_app_name())),
+                );
+            }
+            if crate::platform::is_installed() {
+                std::thread::spawn(|| {
+                    log::info!("NETAssist: disinstallo il servizio temporaneo");
+                    if let Err(e) = crate::platform::uninstall_me(false) {
+                        log::error!("NETAssist: disinstallazione del servizio temporaneo fallita: {}", e);
+                    }
+                });
             }
         }
     }
@@ -343,6 +535,11 @@ fn filter_config_options(options: &mut HashMap<String, String>) {
 async fn handle_config_options(
     mut config_options: HashMap<String, String>,
 ) -> hbb_common::ResultType<()> {
+    // NETAssist: le impostazioni spinte dal portale (es. allow-websocket) vanno applicate SUBITO.
+    // CheckIfRestart si annota i valori attuali e, quando esce di scope, riavvia la connessione al
+    // server ID se e' cambiato websocket/server/api (come fa l'interfaccia del client).
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let _netassist_restart_check = crate::ipc::CheckIfRestart::new();
     filter_config_options(&mut config_options);
     let mut options = Config::get_options();
     let default_settings = config::DEFAULT_SETTINGS.read().unwrap().clone();

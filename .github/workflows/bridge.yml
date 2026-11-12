@@ -41,8 +41,9 @@ jobs:
 
       - name: Install prerequisites
         run: |
-          sudo apt-get install ca-certificates -y
+          # NETAssist: prima l'update dell'indice apt, poi l'install (altrimenti exit code 100)
           sudo apt-get update -y
+          sudo apt-get install ca-certificates -y
           sudo apt-get install -y \
             clang \
             cmake \
