@@ -1,0 +1,23 @@
+# NETAssist - compila e firma il client per tutte le piattaforme.
+# Avvio manuale: GitHub > Actions > "NETAssist release" > Run workflow.
+# I file finiscono in una release (pre-release) del fork con tag netassist-<numero>.
+name: NETAssist release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag della release (es. netassist-1.0.0)"
+        required: true
+        default: "netassist-test"
+
+jobs:
+  build:
+    # i job di RustDesk chiamati qui creano la release e caricano i file: servono i permessi di scrittura
+    permissions:
+      contents: write
+    uses: ./.github/workflows/flutter-build.yml
+    secrets: inherit
+    with:
+      upload-artifact: true
+      upload-tag: ${{ inputs.tag }}

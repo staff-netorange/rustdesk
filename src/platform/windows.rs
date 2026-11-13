@@ -1779,6 +1779,7 @@ copy /Y \"{tmp_path}\\{app_name} Tray.lnk\" \"%PROGRAMDATA%\\Microsoft\\Windows\
 chcp 65001
 md \"{path}\"
 {copy_exe}
+{rename_exe}
 reg add {subkey} /f
 reg add {subkey} /f /v DisplayIcon /t REG_SZ /d \"{display_icon}\"
 reg add {subkey} /f /v DisplayName /t REG_SZ /d \"{app_name}\"
@@ -1810,6 +1811,7 @@ copy /Y \"{tmp_path}\\Uninstall {app_name}.lnk\" \"{path}\\\"
         sleep = if debug { "timeout 300" } else { "" },
         dels = if debug { "" } else { &dels },
         copy_exe = copy_exe_cmd(&src_exe, &exe, &path)?,
+        rename_exe = rename_exe_cmd(&src_exe, &path)?,
         import_config = get_import_config(&exe),
     );
     run_cmds(
@@ -3024,6 +3026,92 @@ pub fn is_user_token_admin(user_token: HANDLE) -> ResultType<bool> {
     }
 }
 
+// NETAssist: avviati come utente admin ma con token FILTRATO da UAC (CreateProcessWithLogonW).
+// Recuperiamo il token elevato COLLEGATO (TokenLinkedToken) e ci ri-lanciamo con quello via
+// CreateProcessWithTokenW (richiede solo SeImpersonatePrivilege, che l'admin possiede): nessun
+// prompt UAC, nessun secure desktop. Cosi' l'install del servizio gira davvero elevata.
+pub fn run_self_elevated(arg: &str) -> ResultType<()> {
+    use base::platform::windows::RAIIHandle;
+    use winapi::um::securitybaseapi::DuplicateTokenEx;
+    use winapi::um::synchapi::WaitForSingleObject;
+    use winapi::um::winnt::{TokenLinkedToken, TokenPrimary, TOKEN_ALL_ACCESS, TOKEN_LINKED_TOKEN};
+    unsafe {
+        let exe = std::env::current_exe()?.to_string_lossy().to_string();
+
+        let mut token: HANDLE = mem::zeroed();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == FALSE {
+            bail!("OpenProcessToken failed: {}", io::Error::last_os_error());
+        }
+        let _token = RAIIHandle(token);
+
+        // token elevato collegato alla sessione admin
+        let mut linked: TOKEN_LINKED_TOKEN = mem::zeroed();
+        let mut ret_len: DWORD = 0;
+        if GetTokenInformation(
+            token,
+            TokenLinkedToken,
+            (&mut linked) as *mut _ as *mut c_void,
+            mem::size_of::<TOKEN_LINKED_TOKEN>() as _,
+            &mut ret_len,
+        ) == FALSE
+        {
+            bail!(
+                "GetTokenInformation(TokenLinkedToken) failed: {}",
+                io::Error::last_os_error()
+            );
+        }
+        let _linked = RAIIHandle(linked.LinkedToken);
+
+        // CreateProcessWithTokenW richiede un token PRIMARIO: duplichiamo il linked token.
+        let mut primary: HANDLE = mem::zeroed();
+        if DuplicateTokenEx(
+            linked.LinkedToken,
+            TOKEN_ALL_ACCESS,
+            NULL as _,
+            SecurityImpersonation,
+            TokenPrimary,
+            &mut primary,
+        ) == FALSE
+        {
+            bail!("DuplicateTokenEx failed: {}", io::Error::last_os_error());
+        }
+        let _primary = RAIIHandle(primary);
+
+        let cmd = format!("\"{}\" {}", exe, arg);
+        let wexe = wide_string(&exe);
+        let mut wcmd = wide_string(&cmd);
+        let mut si: STARTUPINFOW = mem::zeroed();
+        si.cb = mem::size_of::<STARTUPINFOW>() as _;
+        si.dwFlags = STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_HIDE as _;
+        let mut pi: PROCESS_INFORMATION = mem::zeroed();
+        if CreateProcessWithTokenW(
+            primary,
+            LOGON_WITH_PROFILE,
+            wexe.as_ptr(),
+            wcmd.as_mut_ptr(),
+            CREATE_UNICODE_ENVIRONMENT,
+            NULL,
+            NULL as _,
+            &mut si as *mut STARTUPINFOW,
+            &mut pi as *mut PROCESS_INFORMATION,
+        ) == FALSE
+        {
+            bail!("CreateProcessWithTokenW failed: {}", io::Error::last_os_error());
+        }
+        // attende l'esito dell'install (max 120 s) per poterne riportare il risultato
+        WaitForSingleObject(pi.hProcess, 120_000);
+        let mut code: DWORD = 0;
+        let got = GetExitCodeProcess(pi.hProcess, &mut code);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        if got != FALSE && code != 0 {
+            bail!("install elevato uscito con codice {}", code);
+        }
+    }
+    Ok(())
+}
+
 pub fn create_process_with_logon(user: &str, pwd: &str, exe: &str, arg: &str) -> ResultType<()> {
     let last_error_table = HashMap::from([
         (
@@ -4077,10 +4165,10 @@ fn get_import_config(exe: &str) -> String {
     format!("
 sc stop {app_name}
 sc delete {app_name}
-sc create {app_name} binpath= \"\\\"{exe}\\\" --import-config \\\"{config_path}\\\"\" start= auto DisplayName= \"{app_name} Service\"
-sc start {app_name}
-sc stop {app_name}
-sc delete {app_name}
+sc create {app_name}Setup binpath= \"\\\"{exe}\\\" --import-config \\\"{config_path}\\\"\" start= auto DisplayName= \"{app_name} Config Setup\"
+sc start {app_name}Setup
+sc stop {app_name}Setup
+sc delete {app_name}Setup
 ",
     app_name = crate::get_app_name(),
 )
