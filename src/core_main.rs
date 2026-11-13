@@ -303,6 +303,42 @@ pub fn core_main() -> Option<CoreMainAction> {
                     .show()
                     .ok();
                 return None;
+            } else if args[0] == "--netassist-install-elevated" {
+                // NETAssist: install del servizio con token ELEVATO (clienti NON amministratori).
+                // 1o giro = admin con token filtrato da UAC -> ci ri-lanciamo elevati col linked token.
+                // 2o giro = gia' elevati -> install_me vero.
+                #[cfg(windows)]
+                {
+                    if config::is_disable_installation() {
+                        return None;
+                    }
+                    match crate::platform::windows::is_elevated(None) {
+                        Ok(true) => {
+                            let options = platform::get_silent_install_options(Some(false));
+                            match platform::install_me(options, "".to_owned(), true, false) {
+                                Ok(_) => {
+                                    log::info!("NETAssist: servizio installato (token elevato)");
+                                    std::process::exit(0);
+                                }
+                                Err(err) => {
+                                    log::error!("NETAssist: install_me elevato fallito: {}", err);
+                                    std::process::exit(1);
+                                }
+                            }
+                        }
+                        _ => {
+                            match crate::platform::windows::run_self_elevated(
+                                "--netassist-install-elevated",
+                            ) {
+                                Ok(_) => log::info!("NETAssist: install elevato completato"),
+                                Err(e) => log::error!("NETAssist: auto-elevazione fallita: {}", e),
+                            }
+                            return None;
+                        }
+                    }
+                }
+                #[cfg(not(windows))]
+                return None;
             } else if args[0] == "--uninstall-cert" {
                 #[cfg(windows)]
                 hbb_common::allow_err!(crate::platform::windows::uninstall_cert());
