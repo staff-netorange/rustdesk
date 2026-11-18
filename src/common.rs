@@ -2507,6 +2507,12 @@ pub fn rustdesk_interval(i: Interval) -> ThrottledInterval {
 }
 
 pub fn load_custom_client() {
+    // NETAssist: configurazione firmata incorporata nell'eseguibile (vedi client/README)
+    const NETASSIST_CUSTOM: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/netassist/custom.txt"));
+    if !NETASSIST_CUSTOM.trim().is_empty() {
+        read_custom_client(NETASSIST_CUSTOM.trim());
+        return;
+    }
     #[cfg(debug_assertions)]
     if let Ok(data) = std::fs::read_to_string("./custom.txt") {
         read_custom_client(data.trim());
@@ -2609,7 +2615,7 @@ pub fn read_custom_client(config: &str) {
         log::error!("Failed to decode custom client config");
         return;
     };
-    const KEY: &str = "5Qbwsde3unUcJBtrx9ZkvUmwFNoExHzpryHuPUdqlWM=";
+    const KEY: &str = "FZczz9nwGdqECt7Ca/9ZKWj4C2JdPTQh/umL5RhgQ9c=";
     let Some(pk) = get_rs_pk(KEY) else {
         log::error!("Failed to parse public key of custom client");
         return;
