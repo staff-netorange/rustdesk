@@ -188,6 +188,22 @@ pub fn core_main() -> Option<CoreMainAction> {
         return try_send_by_dbus(args[0].clone()).map(CoreMainAction::StartUi);
     }
 
+    // NETAssist: auto-elevazione per clienti ADMIN. Avvio normale (non installato, nessun arg) con utente
+    // admin ma token filtrato (non elevato) -> ci ri-lanciamo elevati col token collegato (nessun prompt
+    // UAC) e usciamo (return None = termina l'originale). L'istanza elevata ha is_elevated=true e NON
+    // riscatta questo blocco (guardia anti-loop). Se l'utente NON e' admin, run_self_elevated_visible()
+    // restituisce Err e si prosegue normalmente, non-elevati (fail-safe: non blocca mai l'avvio).
+    #[cfg(windows)]
+    if !crate::platform::is_installed()
+        && args.is_empty()
+        && !_is_elevate
+        && !_is_run_as_system
+        && !crate::platform::is_elevated(None).unwrap_or(false)
+    {
+        if crate::platform::windows::run_self_elevated_visible().is_ok() {
+            return None;
+        }
+    }
     #[cfg(windows)]
     if !crate::platform::is_installed()
         && args.is_empty()
@@ -302,6 +318,42 @@ pub fn core_main() -> Option<CoreMainAction> {
                     .duration(Duration::Short)
                     .show()
                     .ok();
+                return None;
+            } else if args[0] == "--netassist-install-elevated" {
+                // NETAssist: install del servizio con token ELEVATO (clienti NON amministratori).
+                // 1o giro = admin con token filtrato da UAC -> ci ri-lanciamo elevati col linked token.
+                // 2o giro = gia' elevati -> install_me vero.
+                #[cfg(windows)]
+                {
+                    if config::is_disable_installation() {
+                        return None;
+                    }
+                    match crate::platform::windows::is_elevated(None) {
+                        Ok(true) => {
+                            let options = platform::get_silent_install_options(Some(false));
+                            match platform::install_me(options, "".to_owned(), true, false) {
+                                Ok(_) => {
+                                    log::info!("NETAssist: servizio installato (token elevato)");
+                                    std::process::exit(0);
+                                }
+                                Err(err) => {
+                                    log::error!("NETAssist: install_me elevato fallito: {}", err);
+                                    std::process::exit(1);
+                                }
+                            }
+                        }
+                        _ => {
+                            match crate::platform::windows::run_self_elevated(
+                                "--netassist-install-elevated",
+                            ) {
+                                Ok(_) => log::info!("NETAssist: install elevato completato"),
+                                Err(e) => log::error!("NETAssist: auto-elevazione fallita: {}", e),
+                            }
+                            return None;
+                        }
+                    }
+                }
+                #[cfg(not(windows))]
                 return None;
             } else if args[0] == "--uninstall-cert" {
                 #[cfg(windows)]
@@ -736,7 +788,6 @@ fn import_config(path: &str) {
         return;
     }
     if get_modified_time(&path) > get_modified_time(&Config::file())
-        && get_modified_time(&path) < get_exe_time()
     {
         if store_path(Config::file(), config).is_err() {
             log::info!("config written");

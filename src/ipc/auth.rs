@@ -469,6 +469,30 @@ fn portable_service_helper_is_trusted(
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 #[inline]
+#[cfg(target_os = "windows")]
+#[inline]
+fn windows_netassist_handover_ipc_allowed(peer_exe: &Path, current_exe: &Path) -> bool {
+    // NETAssist: consenti l'IPC tra portable e servizio durante l'handover. Entrambi devono essere un
+    // eseguibile NETAssist.exe dentro una cartella chiamata NETAssist (portable in LocalAppData, servizio
+    // in Program Files). Difesa in profondita': la ACL della pipe e il token handshake restano il confine
+    // di privilegio effettivo.
+    fn is_netassist_binary(p: &Path) -> bool {
+        let name_ok = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.eq_ignore_ascii_case("NETAssist.exe"))
+            .unwrap_or(false);
+        let dir_ok = p
+            .parent()
+            .and_then(|d| d.file_name())
+            .and_then(|n| n.to_str())
+            .map(|n| n.eq_ignore_ascii_case("NETAssist"))
+            .unwrap_or(false);
+        name_ok && dir_ok
+    }
+    is_netassist_binary(peer_exe) && is_netassist_binary(current_exe)
+}
+
 fn ensure_peer_executable_matches_current_by_pid(peer_pid: u32, postfix: &str) -> ResultType<()> {
     let peer_exe = peer_exe_canonical_path_by_pid(peer_pid)?;
     let current_exe = current_exe_canonical_path()?;
@@ -481,6 +505,15 @@ fn ensure_peer_executable_matches_current_by_pid(peer_pid: u32, postfix: &str) -
     }
     #[cfg(target_os = "windows")]
     if windows_portable_service_ipc_allows_logon_helper_executable(&peer_exe, postfix) {
+        return Ok(());
+    }
+    #[cfg(target_os = "windows")]
+    if windows_netassist_handover_ipc_allowed(&peer_exe, &current_exe) {
+        log::info!(
+            "NETAssist: IPC portable-servizio consentito per handover: peer_exe='{}', current_exe='{}'",
+            peer_exe.display(),
+            current_exe.display()
+        );
         return Ok(());
     }
     bail!(
